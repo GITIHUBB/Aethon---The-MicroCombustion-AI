@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+chromadb
+google-genai
+cohere
+python-dotenv
+pydantic
+tenacity
+requests
+pypdf
+sentence-transformers
