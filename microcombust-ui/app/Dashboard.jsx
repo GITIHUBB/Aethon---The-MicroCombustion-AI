@@ -113,6 +113,14 @@ const WELCOME = {
   confidence: null,
 };
 
+// Always-available starting point. These stay on screen until the first
+// response produces a more specific, context-aware follow-up set.
+const DEFAULT_SUGGESTIONS = [
+  'What drives flame spread in microgravity?',
+  'Which materials self-extinguish in microgravity?',
+  'How does oxygen concentration affect combustion limits?',
+];
+
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
@@ -149,37 +157,146 @@ function normalizeRanking(data) {
     .filter((r) => r.material);
 }
 
-// Accepts the grounded-RAG shape { answer, sources: [{source, snippet}] }
-// (falling back to the legacy { citations: [{title,url,confidence}] } shape).
+// Accepts the grounded-RAG shape { answer, retrieved_sources, citations, sources }
+// and normalises every variant into one numbered citation record per chunk.
 function normalizeAnswer(data) {
-  const citations =
-    data?.sources ||
-    data?.citations ||
-    (data?.citation_url ? [{ source: data.citation_title || 'NASA source', snippet: '', url: data.citation_url }] : []);
-  const list = citations.map((c) => ({
-    title: c.source || c.title || c.name || 'NASA source',
-    source: c.source || c.title || c.name,
-    snippet: c.snippet || '',
-    url: c.url || c.link,
-    confidence: c.confidence ?? c.score ?? null,
-  }));
+  const retrieved = Array.isArray(data?.retrieved_sources) ? data.retrieved_sources : [];
+  const rawCitations = Array.isArray(data?.citations) ? data.citations : [];
+  const rawSources = Array.isArray(data?.sources) ? data.sources : [];
+  const list = [];
+  const seen = new Set();
+
+  const add = (item, index) => {
+    if (!item) return;
+    const number = Number(item.number) || index + 1;
+    const filename = item.filename || fileNameOf(item.source || '') || fileNameOf(item.title || '');
+    const title = item.title || item.filename || item.source || item.name || 'NASA source';
+    const page = item.page ?? null;
+    const key = `${number}|${filename || title}|${page ?? ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    list.push({
+      number,
+      title,
+      filename,
+      source: item.source || filename || title,
+      page,
+      url: item.url || item.link || null,
+      snippet: item.snippet || item.text || '',
+      confidence: item.confidence ?? item.score ?? null,
+    });
+  };
+
+  if (retrieved.length) retrieved.forEach(add);
+  else if (rawCitations.length) rawCitations.forEach(add);
+  else if (rawSources.length) rawSources.forEach(add);
+  else if (data?.citation_url) {
+    add({
+      number: 1,
+      title: data.citation_title || 'NASA source',
+      source: data.citation_title || data.citation_url,
+      url: data.citation_url,
+      page: null,
+      snippet: '',
+    }, 0);
+  }
+
+  // A bare sources list may still carry the passage text the rich records omit.
+  if (rawSources.length) {
+    rawSources.forEach((src, i) => {
+      if (list[i] && !list[i].snippet && src.snippet) list[i].snippet = src.snippet;
+    });
+  }
+
   const confidence =
     data?.confidence ??
     (list.length && list.every((c) => c.confidence != null)
       ? list.reduce((a, c) => a + c.confidence, 0) / list.length
       : null);
+
+  // Source pills and the chunks accordion both consume this ordered list, so
+  // citation [1] always opens the first retrieved ChromaDB passage.
+  const sources = (retrieved.length ? retrieved : list).map((src, i) => ({
+    ...src,
+    number: Number(src.number) || i + 1,
+    filename: src.filename || fileNameOf(src.source || '') || fileNameOf(src.title || ''),
+    title: src.title || src.filename || src.source || 'NASA source',
+  }));
+
   return {
     text: data?.answer || data?.response || 'No answer returned.',
     citations: list,
     confidence,
     question: data?.question || null,
-    // Full ChromaDB passages, so the source-chunks accordion can render the
-    // raw context passage each answer was grounded in.
-    sources: Array.isArray(data?.retrieved_sources) ? data.retrieved_sources : [],
+    sources,
   };
 }
 
 const pct = (c) => (c == null ? null : Math.round((c <= 1 ? c * 100 : c)));
+
+const uniqueStrings = (items) => {
+  const seen = new Set();
+  return (Array.isArray(items) ? items : [])
+    .map((item) => String(item || '').trim())
+    .filter((item) => {
+      if (!item) return false;
+      const key = item.toLowerCase().replace(/[?!.]+$/, '');
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+};
+
+// Offline/local follow-ups. They keep the pill row populated when the
+// /quick-questions endpoint is unavailable and refresh with the latest answer.
+function deriveSuggestions({ question, answer, fuel, oxygen, gravity, previous = [] }) {
+  const context = `${question || ''} ${answer || ''}`.toLowerCase();
+  const pool = [];
+  const add = (...items) => pool.push(...items);
+
+  if (/extinct|extinguish|flammability limit/.test(context)) {
+    add(
+      'What extinction limits were measured in microgravity?',
+      'How does airflow velocity change extinction behavior?',
+    );
+  }
+  if (/oxygen|o₂|o2|atmosphere/.test(context)) {
+    add(
+      'How does oxygen concentration shift the flammability limit?',
+      'What oxygen level is required for sustained flame spread?',
+    );
+  }
+  if (/pressure|kpa|atm\b/.test(context)) {
+    add('How does ambient pressure affect flame spread?');
+  }
+  if (/airflow|ventilation|forced flow/.test(context)) {
+    add('How does forced airflow suppress or spread a flame?');
+  }
+  if (/pmma|silicone|cotton|nomex|kevlar|material/.test(context)) {
+    add(`What are the fire safety risks of ${fuel}?`);
+  }
+  if (/smoke|detector|aerosol/.test(context)) {
+    add('How do smoke detectors perform in microgravity?');
+  }
+
+  add(
+    `Compare ${fuel} fire behavior at ${gravity} and 1g.`,
+    `How does ${oxygen}% O₂ affect flame spread at ${gravity}?`,
+    'Which materials self-extinguish in microgravity?',
+    'What do the retrieved NASA papers recommend for spacecraft fire safety?',
+    ...DEFAULT_SUGGESTIONS,
+  );
+
+  const blocked = new Set(
+    uniqueStrings([question, ...previous]).map((q) =>
+      q.toLowerCase().replace(/[?!.]+$/, ''),
+    ),
+  );
+  const fresh = uniqueStrings(pool).filter(
+    (q) => !blocked.has(q.toLowerCase().replace(/[?!.]+$/, '')),
+  );
+  return fresh.length >= 3 ? fresh.slice(0, 4) : uniqueStrings([...fresh, ...DEFAULT_SUGGESTIONS]).slice(0, 4);
+}
 
 /* ------------------------------------------------------------------ */
 /* Small UI pieces                                                     */
@@ -256,21 +373,58 @@ function RiskChip({ tier }) {
 
 function Citation({ message, onOpenSource }) {
   const [chunksOpen, setChunksOpen] = useState(false);
-  const c = pct(message.confidence);
-  const count = message.citations.length;
-  const passages = message.sources || [];
+  // Safely extract confidence, default to 0 if unavailable
+  const rawConfidence = message.confidence ?? message.citation_confidence ?? 0;
+  const c = pct(rawConfidence);
+  // Support multiple possible key names from backend / normalizeAnswer
+  // Try citations first, then answer_citations, then sources, then retrieved_sources, then citation_list
+  const citations = message.citations
+    || message.answer_citations
+    || message.sources
+    || message.retrieved_sources
+    || message.citation_list
+    || message.chunks
+    || [];
+  // Support multiple possible key names from backend / normalizeAnswer.
+  const sources = message.sources || message.retrieved_sources || [];
+  const count = sources.length > 0 ? sources.length : (citations?.length ?? 0);
+  // Support multiple possible key names for source passages.
+  const passages = message.sources
+    || message.retrieved_sources
+    || message.passages
+    || message.context
+    || message.documents
+    || message.chunks
+    || [];
 
-  // One badge per unique source PDF for the clickable source-badge row.
-  const seen = new Set();
-  const badges = message.citations.filter((s) => {
-    const key = String(s.title || s.source || '').toLowerCase();
-    if (seen.has(key)) return false;
-    seen.add(key);
+  // One badge per numbered ChromaDB chunk. The number is the same [n] tag the
+  // assistant cites inline, so the mapping is unambiguous even when two chunks
+  // come from different pages of the same PDF.
+  // Normalize display numbers and deduplicate sources by (title, page) pair.
+  const allSources = sources.length > 0 ? sources : citations;
+  const normalized = allSources.map((s, i) => ({
+    ...s,
+    displayNumber: Number(s.number) || i + 1,
+  }));
+  // Deduplicate by displayNumber + normalized title + page so that duplicate
+  // chunk indexes don't stack or overlap in the pill row.
+  const seenKeys = new Set();
+  const badges = normalized.filter((s) => {
+    const title = String(s.title || s.source || s.filename || '').toLowerCase();
+    const page = s.page ?? '';
+    const key = `${s.displayNumber}|${title}|${page}`;
+    if (seenKeys.has(key)) return false;
+    seenKeys.add(key);
     return true;
   });
 
   const findPassage = (source) => {
-    const name = fileNameOf(source);
+    const number = Number(source?.number ?? source?.displayNumber);
+    if (Number.isFinite(number) && number > 0) {
+      const numbered = passages.find((p) => Number(p.number) === number);
+      if (numbered) return numbered;
+    }
+    const name = fileNameOf(source?.title || source?.source || source?.filename || source);
     return (
       passages.find((p) => fileNameOf(p.filename || p.source || '') === name) ||
       passages[0]
@@ -278,8 +432,8 @@ function Citation({ message, onOpenSource }) {
   };
 
   const openPassage = (s) => {
-    const passage = findPassage(s.title || s.source);
-    onOpenSource?.(passage || { filename: s.title, snippet: s.snippet, source: s.source });
+    const passage = findPassage(s);
+    onOpenSource?.(passage || { ...s, filename: s.title, snippet: s.snippet });
   };
 
   return (
@@ -291,15 +445,15 @@ function Citation({ message, onOpenSource }) {
         ) : (
           badges.map((s, i) => (
             <button
-              key={`badge-${i}`}
+              key={`badge-${s.displayNumber}-${i}`}
               type="button"
-              aria-label={`View source chunk for ${s.title}`}
-              title={`Raw ChromaDB chunk for ${s.title}`}
+              aria-label={`View source chunk ${s.displayNumber} for ${s.title}`}
+              title={`[${s.displayNumber}] Raw ChromaDB chunk for ${s.title}`}
               onClick={() => openPassage(s)}
               className="src-badge"
             >
               <FileText aria-hidden />{' '}
-              <span>📄 Source: {s.title}</span>
+              <span>[{s.displayNumber}] {s.title}</span>
               {s.snippet && <span className="src-badge-hint" aria-hidden>{'…'}</span>}
             </button>
           ))
@@ -328,6 +482,7 @@ function Citation({ message, onOpenSource }) {
               <div className="chunk">
                 <div className="chunk-head">
                   <span className="chunk-title">
+                    {p.number ? `[${p.number}] ` : ''}
                     {p.filename || fileNameOf(p.source || '') || 'NASA source'}
                   </span>
                   <span className="chunk-page">
@@ -359,8 +514,10 @@ function Citation({ message, onOpenSource }) {
 /* ------------------------------------------------------------------ */
 /* Inline citation pills + source viewer                               */
 /* ------------------------------------------------------------------ */
-// Matches the markers the prompt asks Gemini to emit, e.g. [19930010989.pdf p.202]
-const CITATION_RE = /\[([^\[\]]+?\.pdf)\s+(?:p|page)\.?\s*(\d+)\]/gi;
+// The backend now emits numeric markers such as [1] and [2]. The legacy
+// file-name marker is still recognised so older cached answers stay clickable.
+const RAW_CITATION_RE = /^\[([^\[\]]+?\.pdf)\s*,?\s*(?:p|page)\.?\s*(\d+|n\/a)\]/i;
+const NUM_CITATION_RE = /^\[(\d{1,3})\]$/;
 
 const fileNameOf = (value) =>
   String(value || '')
@@ -372,74 +529,80 @@ const fileNameOf = (value) =>
 // Resolve a marker against the passages ChromaDB returned for this answer.
 function findSource(sources, filename, page) {
   if (!sources?.length) return null;
-  const name = String(filename || '').trim().toLowerCase();
+  const name = fileNameOf(filename);
   const matches = sources.filter(
     (s) => fileNameOf(s.filename || s.source) === name
   );
   if (!matches.length) return null;
-  return matches.find((s) => String(s.page) === String(page)) || matches[0];
+  return matches.find((s) => String(s.page).toLowerCase() === String(page).toLowerCase()) || matches[0];
 }
 
-// Splits an answer into plain text and clickable citation pills.
-function AnswerText({ text, sources, onOpen }) {
-  const value = String(text || '');
-  const nodes = [];
-  let cursor = 0;
-  let key = 0;
-
-  for (const match of value.matchAll(CITATION_RE)) {
-    const [whole, filename, page] = match;
-    const at = match.index ?? 0;
-    if (at > cursor) nodes.push(<span key={`t${key++}`}>{value.slice(cursor, at)}</span>);
-
-    const source = findSource(sources, filename, page);
-    nodes.push(
-      <button
-        key={`c${key++}`}
-        type="button"
-        onClick={() => onOpen(source || { filename, page, snippet: null })}
-        title={
-          source
-            ? 'Show the passage this claim was drawn from'
-            : 'No stored passage matched this citation'
-        }
-        className="cite"
-      >
-        <FileText aria-hidden />
-        <span>{whole.slice(1, -1)}</span>
-      </button>
-    );
-    cursor = at + whole.length;
-  }
-
-  if (cursor < value.length) nodes.push(<span key={`t${key++}`}>{value.slice(cursor)}</span>);
-  return <>{nodes}</>;
+function findSourceByNumber(sources, number) {
+  if (!sources?.length) return null;
+  const n = Number(number);
+  if (!Number.isFinite(n) || n < 1) return null;
+  return sources.find((s) => Number(s.number) === n) || sources[n - 1] || null;
 }
 
+// Defensive display cleanup: the API sanitises answers, but this also keeps
+// older messages and pasted model output from showing literal HTML/callouts.
+function sanitizeForDisplay(text) {
+  return String(text || '')
+    .replace(/<\s*br\s*\/?\s*>/gi, '\n')
+    .replace(/<\s*(?:b|strong)\b[^>]*>/gi, '**')
+    .replace(/<\s*\/\s*(?:b|strong)\s*>/gi, '**')
+    .replace(/<\s*(?:i|em)\b[^>]*>/gi, '*')
+    .replace(/<\s*\/\s*(?:i|em)\s*>/gi, '*')
+    // Only strip real tags (a letter after "<"), so comparisons like "< 15%"
+    // or "1 > 0" survive as ordinary text.
+    .replace(/<\/?[a-zA-Z][^>]*>/g, '')
+    .replace(/\[!(?:NOTE|WARNING|TIP|IMPORTANT|CAUTION)\]/gi, '')
+    .replace(/^[ \t]*```[a-zA-Z0-9_-]*[ \t]*$/gm, '')
+    .replace(/^[ \t]*>[ \t]?/gm, '')
+    .replace(/^[ \t]*#[ \t]+/gm, '## ')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\n{3,}/g, '\n\n');
+}
 
 function inlineToNodes(str, sources, onOpen) {
   const nodes = [];
   let cursor = 0;
-  const tokenRe = /(\[[^\]]+\.pdf[^\]]*\]|\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/g;
+  const tokenRe = /(\[[^\]]+\]\([^)]+\)|\[[^\[\]]+?\.pdf[^\[\]]*\]|\*\*[^*]+\*\*|`[^`]+`|\[\d{1,3}\])/g;
   let m;
   while ((m = tokenRe.exec(str || '')) !== null) {
     const at = m.index;
     if (at > cursor) nodes.push(<span key={cursor}>{String(str).slice(cursor, at)}</span>);
     const whole = m[0];
-    if (CITATION_RE.test(whole)) {
-      const cm = whole.match(CITATION_RE);
-      const [wholeC, filename, page] = cm;
+    const raw = RAW_CITATION_RE.exec(whole);
+    const numeric = NUM_CITATION_RE.exec(whole);
+    if (raw) {
+      const [, filename, page] = raw;
       const source = findSource(sources, filename, page);
       nodes.push(
         <button
           key={at}
           type="button"
-          onClick={() => onOpen(source || { filename, page: Number(page), snippet: null })}
+          onClick={() => onOpen(source || { filename, page, snippet: null })}
           title={source ? 'Show the passage this claim was drawn from' : 'No stored passage matched this citation'}
           className="cite"
         >
           <FileText aria-hidden />
-          <span>{wholeC.slice(1, -1)}</span>
+          <span>{whole.slice(1, -1)}</span>
+        </button>
+      );
+    } else if (numeric) {
+      const number = numeric[1];
+      const source = findSourceByNumber(sources, number);
+      nodes.push(
+        <button
+          key={at}
+          type="button"
+          onClick={() => onOpen(source || { number: Number(number), snippet: null })}
+          title={source ? `Show source chunk [${number}]` : `No stored passage matched citation [${number}]`}
+          className="cite"
+        >
+          <FileText aria-hidden />
+          <span>[{number}]</span>
         </button>
       );
     } else if (whole.startsWith('**') && whole.endsWith('**')) {
@@ -461,7 +624,7 @@ function inlineToNodes(str, sources, onOpen) {
 }
 
 function markdownToBlocks(text, sources, onOpen) {
-  const lines = String(text || '').split(/\r?\n/);
+  const lines = sanitizeForDisplay(text).split(/\r?\n/);
   const blocks = [];
   let i = 0;
   while (i < lines.length) {
@@ -470,18 +633,6 @@ function markdownToBlocks(text, sources, onOpen) {
       const level = line.match(/^#+/)[0].length;
       blocks.push({ type: 'heading', level, content: inlineToNodes(line.replace(/^#{2,6}\s*/, ''), sources, onOpen) });
       i++;
-      continue;
-    }
-    const co = line.match(/^>\s*\[(!NOTE|!TIP|!WARNING)\]\s*(.*)/i);
-    if (co) {
-      let body = co[2];
-      let j = i + 1;
-      while (j < lines.length && /^>\s/.test(lines[j]) && !/^>\s*\[!/.test(lines[j])) {
-        body += ' ' + lines[j].replace(/^>\s*/, '');
-        j++;
-      }
-      blocks.push({ type: 'callout', kind: co[1], body: inlineToNodes(body, sources, onOpen) });
-      i = j;
       continue;
     }
     if (/^\s*\|/.test(line) && /\|\s*$/.test(line)) {
@@ -516,7 +667,6 @@ function markdownToBlocks(text, sources, onOpen) {
       j < lines.length &&
       lines[j].trim() !== '' &&
       !/^#{2,6}\s/.test(lines[j]) &&
-      !/^>\s*\[!/.test(lines[j]) &&
       !/^\s*\|/.test(lines[j]) &&
       !/^\s*[-*]\s/.test(lines[j])
     ) {
@@ -561,15 +711,6 @@ function MarkdownBlock({ text, sources, onOpen }) {
         if (b.type === 'heading') {
           const Tag = b.level === 2 ? 'h2' : b.level === 3 ? 'h3' : 'h4';
           return <Tag key={i} className="md-h">{b.content}</Tag>;
-        }
-        if (b.type === 'callout') {
-          const accent = b.kind === '!WARNING' ? '#fb7185' : b.kind === '!TIP' ? '#fbbf24' : '#22d3ee';
-          return (
-            <div key={i} className="md-callout" style={{ '--k': accent }}>
-              <span className="md-callout-kind">{b.kind.slice(1)}</span>
-              <span className="md-callout-body">{b.body}</span>
-            </div>
-          );
         }
         if (b.type === 'table') return <MarkdownTable key={i} rows={b.rows} />;
         if (b.type === 'list') {
@@ -904,10 +1045,12 @@ export default function Dashboard() {
   const [draft, setDraft] = useState('');
   const [thinking, setThinking] = useState(false);
   const [docCount, setDocCount] = useState(null);
-  const [quickQuestions, setQuickQuestions] = useState([]);
+  const [quickQuestions, setQuickQuestions] = useState(DEFAULT_SUGGESTIONS);
   const [chipsLoading, setChipsLoading] = useState(false);
   const [openSource, setOpenSource] = useState(null);
   const endRef = useRef(null);
+  // Ignore out-of-order follow-up responses if the user submits again quickly.
+  const chipsRequestRef = useRef(0);
   // Header gains its glass bar once the page has scrolled.
   const [scrolled, setScrolled] = useState(false);
   // Backdrop canvases + the handle the effect below exposes (slider flare, gravity).
@@ -1294,46 +1437,64 @@ export default function Dashboard() {
     }
   }
 
-  async function fetchChips() {
-    const lastUser = [...messages]
-      .reverse()
-      .find((m) => m.role === 'user');
-    const lastAssistant = [...messages]
-      .reverse()
-      .find((m) => m.role === 'assistant' && m.id !== 'welcome' && !m.error);
+  // Refresh follow-up prompts for the turn that just completed. The explicit
+  // question/answer arguments avoid the stale-closure bug where the old
+  // messages array was sampled before the new answer existed.
+  async function fetchChips({ question: asked, answer: assistantAnswer = '', history: priorHistory = [] } = {}) {
+    const lastUser = String(asked || '').trim();
     if (!lastUser) return;
+    const requestId = chipsRequestRef.current + 1;
+    chipsRequestRef.current = requestId;
     setChipsLoading(true);
+
+    let generated = [];
     try {
       const res = await apiFetch('/quick-questions', {
-        question: lastUser.text,
-        answer: lastAssistant ? lastAssistant.text : '',
-        history: messages
-          .filter((m) => m.id !== 'welcome' && !m.error && (m.text || '').trim())
-          .slice(-40)
-          .map((m) => ({ role: m.role === 'user' ? 'user' : 'model', text: m.text })),
+        question: lastUser,
+        answer: assistantAnswer,
+        history: priorHistory,
       });
       if (res.ok) {
         const data = await res.json();
-        setQuickQuestions(Array.isArray(data.questions) ? data.questions : []);
-      } else {
-        setQuickQuestions([]);
+        generated = Array.isArray(data.questions) ? data.questions : [];
       }
     } catch {
-      setQuickQuestions([]);
-    } finally {
-      setChipsLoading(false);
+      /* endpoint unavailable - local suggestions below keep the row populated */
     }
+
+    const fallback = deriveSuggestions({
+      question: lastUser,
+      answer: assistantAnswer,
+      fuel,
+      oxygen,
+      gravity,
+      previous: quickQuestions,
+    });
+    const merged = uniqueStrings([...generated, ...fallback]);
+    if (chipsRequestRef.current !== requestId) return;
+    setQuickQuestions(merged.length ? merged.slice(0, 4) : DEFAULT_SUGGESTIONS);
+    setChipsLoading(false);
+  }
+
+  // One entry point for typed messages and suggestion-pill clicks. Pills call
+  // submitQuery directly, which fills the input, submits it and clears it again.
+  function submitQuery(value) {
+    const query = String(value ?? '').trim();
+    if (!query || thinking) return;
+    setDraft(query);
+    void sendMessage(query);
   }
 
   async function sendQuery(e) {
     e?.preventDefault();
-    const query = draft.trim();
+    submitQuery(draft);
+  }
+
+  async function sendMessage(query) {
     if (!query || thinking) return;
     // Prior turns ride along with the request so the backend can replay them to
-    // the AI model as conversation history. This is what lets it remember details the
-    // user mentioned earlier (a name, a preference) instead of starting cold.
-    // `messages` still excludes the message being sent, so the new turn is not
-    // duplicated in the history.
+    // the AI model as conversation history. `messages` still excludes the
+    // message being sent, so the new turn is not duplicated in the history.
     const history = messages
       .filter((m) => m.id !== 'welcome' && !m.error && (m.text || '').trim())
       .slice(-40)
@@ -1341,6 +1502,8 @@ export default function Dashboard() {
     setMessages((m) => [...m, { id: `u${Date.now()}`, role: 'user', text: query }]);
     setDraft('');
     setThinking(true);
+
+    let answerText = '';
     try {
       const res = await apiFetch('/query-agent', {
         query,
@@ -1353,6 +1516,7 @@ export default function Dashboard() {
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const a = normalizeAnswer(await res.json());
+      answerText = a.text;
       setApiOnline(true);
       setMessages((m) => [...m, { id: `a${Date.now()}`, role: 'assistant', ...a }]);
     } catch {
@@ -1366,11 +1530,14 @@ export default function Dashboard() {
           text: `I could not reach the backend on ${API_CANDIDATES.join(', ')}. Start the FastAPI server and try again.`,
           citations: [],
           confidence: null,
+          sources: [],
         },
       ]);
     } finally {
-      await fetchChips();
       setThinking(false);
+      // Refresh the row in the background; existing pills stay clickable until
+      // the new set arrives, so the suggestions never disappear.
+      void fetchChips({ question: query, answer: answerText, history });
     }
   }
 
@@ -1610,13 +1777,17 @@ export default function Dashboard() {
                 <div key={m.id} className={`m${m.role === 'user' ? ' u' : ''}`}>
                   <span className="av">{m.role === 'user' ? 'You' : <Sparkles aria-hidden />}</span>
                   <div className={`bub${m.error ? ' err' : ''}`}>
-                    <p className="whitespace-pre-wrap">
+                    <div className="whitespace-pre-wrap">
                       {m.role === 'assistant' ? (
-                        <MarkdownBlock text={m.text} sources={m.sources} onOpen={setOpenSource} />
+                        <MarkdownBlock
+                          text={m.text}
+                          sources={m.sources?.length ? m.sources : m.citations}
+                          onOpen={setOpenSource}
+                        />
                       ) : (
                         m.text
                       )}
-                    </p>
+                    </div>
                     {m.role === 'assistant' && m.id !== 'welcome' && !m.error && (
                       <Citation message={m} onOpenSource={setOpenSource} />
                     )}
@@ -1625,46 +1796,30 @@ export default function Dashboard() {
               ))}
               {thinking && (
                 <div className="thinking">
-                  <Loader2 className="animate-spin" aria-hidden /> Overthinking this so you don't have to…
+                  <Loader2 className="animate-spin" aria-hidden /> Overthinking this so you don&apos;t have to…
                 </div>
               )}
               <div ref={endRef} />
             </div>
-            {quickQuestions.length > 0 || chipsLoading || !messages.some((m) => m.role === 'user') ? (
-              <div className="chips">
-                {chipsLoading ? (
-                  <span className="chip" aria-hidden>Generating follow-ups…</span>
-                ) : quickQuestions.length > 0 ? (
-                  quickQuestions.map((q, i) => (
-                    <button
-                      key={i}
-                      type="button"
-                      onClick={() => setDraft(q)}
-                      className="chip chip-suggest"
-                      title={q}
-                    >
-                      {q}
-                    </button>
-                  ))
-                ) : (
-                  [
-                    'What drives flame spread in microgravity?',
-                    'Which materials self-extinguish?',
-                    'How does oxygen concentration affect combustion?'
-                  ].map((q, i) => (
-                    <button
-                      key={i}
-                      type="button"
-                      onClick={() => setDraft(q)}
-                      className="chip chip-suggest"
-                      title={q}
-                    >
-                      {q}
-                    </button>
-                  ))
-                )}
-              </div>
-            ) : null}
+            <div className="chips" aria-label="Suggested follow-up questions" aria-busy={chipsLoading}>
+              {(quickQuestions.length ? quickQuestions : DEFAULT_SUGGESTIONS).map((q, i) => (
+                <button
+                  key={`${q}-${i}`}
+                  type="button"
+                  onClick={() => submitQuery(q)}
+                  disabled={thinking}
+                  className="chip chip-suggest"
+                  title={`Ask: ${q}`}
+                >
+                  {q}
+                </button>
+              ))}
+              {chipsLoading && (
+                <span className="chip chip-loading" aria-hidden>
+                  Refreshing follow-ups…
+                </span>
+              )}
+            </div>
 
             <form onSubmit={sendQuery} className="composer">
               <input

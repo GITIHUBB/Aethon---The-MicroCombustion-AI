@@ -809,6 +809,7 @@ body::before {
   }
   .msgs {
     flex: 1;
+    max-height: 70vh;
     overflow-y: auto;
     min-height: 0;
     padding: 20px;
@@ -1427,6 +1428,7 @@ body::before {
     border-radius: 4px;
   }
   .chips {
+    justify-content: center;
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
@@ -1460,6 +1462,21 @@ body::before {
     border-color: var(--vi);
     background: rgba(167,139,250,0.18);
     color: #fff;
+  }
+  .chip:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .chip:disabled:hover {
+    border-color: rgba(167,139,250,0.35);
+    background: rgba(167,139,250,0.08);
+    color: #c7b3ff;
+  }
+  .chip-loading {
+    border-color: rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.04);
+    color: var(--m);
+    cursor: default;
   }
 }
 

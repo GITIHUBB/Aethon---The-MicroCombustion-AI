@@ -16,6 +16,7 @@ results instead of silently dropping into demo mode.
 
 from __future__ import annotations
 
+import html
 import importlib.util
 import json
 import os
@@ -370,6 +371,146 @@ def source_title(meta: dict, source: Any) -> str:
     return f"{name} (p. {page})" if page is not None else name
 
 
+# --- Output sanitation -------------------------------------------------------
+# LLMs occasionally ignore formatting instructions and emit HTML colour spans,
+# GitHub-style alert callouts or full PDF paths. The frontend renders Markdown,
+# not HTML, so those artifacts show up as literal gibberish. Everything below
+# turns any such output back into the clean Markdown contract before it leaves
+# the API: headings, bold text, dash bullets and numeric citations only.
+_HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+_RAW_FILE_CITATION_RE = re.compile(
+    r"\[([^\[\]]+?\.pdf)(?:\s*,?\s*(?:p|page)\.?\s*(\d+|n/?a))?\]",
+    re.IGNORECASE,
+)
+_NUM_CITATION_RE = re.compile(r"\[(\d{1,3})\](?!\()")
+_NUM_CITATION_LIST_RE = re.compile(r"\[(\d{1,3}(?:\s*[,;]\s*\d{1,3})+)\]")
+_CALLOUT_LINE_RE = re.compile(
+    r"^[ \t]*>[ \t]*\[!(NOTE|WARNING|TIP|IMPORTANT|CAUTION)\][ \t]*",
+    re.IGNORECASE | re.MULTILINE,
+)
+_CALLOUT_MARKER_RE = re.compile(
+    r"\[!(?:NOTE|WARNING|TIP|IMPORTANT|CAUTION)\]", re.IGNORECASE
+)
+_BLOCKQUOTE_PREFIX_RE = re.compile(r"^[ \t]*>[ \t]?", re.MULTILINE)
+
+
+def _citation_lookup(citations: list) -> tuple[dict, dict]:
+    """Index citations by ``(file name, page)`` and by file name alone."""
+    by_page: dict = {}
+    by_name: dict = {}
+    for index, citation in enumerate(citations or [], 1):
+        number = int(citation.get("number") or index)
+        page = str(citation.get("page") or "").strip().lower()
+        for candidate in (
+            citation.get("filename"),
+            citation.get("source"),
+            citation.get("title"),
+        ):
+            name = _file_name(candidate).lower()
+            # Titles are rendered as "paper.pdf (p. 12)"; keep only the file.
+            name = re.sub(r"\s*\(p\.?\s*[^)]+\)\s*$", "", name).strip()
+            if not name:
+                continue
+            by_name.setdefault(name, number)
+            if page:
+                by_page.setdefault((name, page), number)
+    return by_page, by_name
+
+
+def _sanitize_answer(text: str, citations: Optional[list] = None) -> str:
+    """Normalise model output to clean Markdown with numeric citations."""
+    if not text:
+        return ""
+
+    answer = html.unescape(str(text))
+
+    # --- AGGRESSIVE HTML TAG STRIPPING ---
+    # Remove any remaining <span style="..."> or other inline styles
+    answer = re.sub(r'<span[^>]*?>', '', answer, flags=re.IGNORECASE)
+    answer = re.sub(r'</span>', '', answer, flags=re.IGNORECASE)
+    answer = re.sub(r'<[^>]*style=[^>]*>', '', answer, flags=re.IGNORECASE)
+    answer = re.sub(r'<[^>]*>', '', answer, flags=re.IGNORECASE)
+
+    # Preserve block breaks before dropping tags, then map simple emphasis
+    # tags to their Markdown equivalents so meaning is not lost.
+    answer = re.sub(r"<\s*br\s*/?\s*>", "\n", answer, flags=re.IGNORECASE)
+    answer = re.sub(
+        r"</\s*(?:p|div|li|tr|h[1-6])\s*>", "\n", answer, flags=re.IGNORECASE
+    )
+    answer = re.sub(
+        r"<\s*(?:b|strong)\b[^>]*>(.*?)</\s*(?:b|strong)\s*>",
+        r"**\1**",
+        answer,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    answer = re.sub(
+        r"<\s*(?:i|em)\b[^>]*>(.*?)</\s*(?:i|em)\s*>",
+        r"*\1*",
+        answer,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    answer = re.sub(
+        r"<\s*code\b[^>]*>(.*?)</\s*code\s*>",
+        r"`\1`",
+        answer,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    answer = _HTML_TAG_RE.sub("", answer)
+    answer = answer.replace("\u00a0", " ")
+
+    # GitHub alert callouts become bold lead-ins, never blockquote markers.
+    answer = _CALLOUT_LINE_RE.sub(
+        lambda match: f"**{match.group(1).title()}:** ", answer
+    )
+    answer = _CALLOUT_MARKER_RE.sub("", answer)
+    answer = _BLOCKQUOTE_PREFIX_RE.sub("", answer)
+
+    # Remove any remaining bare callout markers that might survive
+    answer = answer.replace('[!NOTE]', '').replace('[!WARNING]', '').replace('[!TIP]', '')
+
+    # Drop fences that wrap the briefing in a code block; they otherwise render
+    # as literal backticks around the whole answer.
+    answer = re.sub(
+        r"^[ \t]*```[a-zA-Z0-9_-]*[ \t]*$", "", answer, flags=re.MULTILINE
+    )
+
+    # The dashboard only understands "##" and deeper headings.
+    answer = re.sub(r"^[ \t]*#[ \t]+", "## ", answer, flags=re.MULTILINE)
+
+    citations = list(citations or [])
+    by_page, by_name = _citation_lookup(citations)
+
+    def _raw_citation(match: re.Match) -> str:
+        name = _file_name(match.group(1)).lower()
+        page = (match.group(2) or "").strip().lower()
+        number = by_page.get((name, page)) or by_name.get(name)
+        if number is None and len(citations) == 1:
+            number = 1
+        return f"[{number}]" if number is not None else ""
+
+    answer = _RAW_FILE_CITATION_RE.sub(_raw_citation, answer)
+
+    # Collapse "[1, 2]" into "[1] [2]" before validating every number.
+    answer = _NUM_CITATION_LIST_RE.sub(
+        lambda match: " ".join(
+            f"[{number}]" for number in re.findall(r"\d+", match.group(1))
+        ),
+        answer,
+    )
+
+    if citations:
+        def _valid_citation(match: re.Match) -> str:
+            number = int(match.group(1))
+            return match.group(0) if 1 <= number <= len(citations) else ""
+
+        answer = _NUM_CITATION_RE.sub(_valid_citation, answer)
+
+    # Tidy whitespace left behind by removed markup.
+    answer = re.sub(r"[ \t]+\n", "\n", answer)
+    answer = re.sub(r"\n{3,}", "\n\n", answer)
+    return answer.strip()
+
+
 def _primary_key(explicit: Optional[str] = None) -> Optional[str]:
     """Resolve the Groq API key, rejecting empty values and `.env` placeholders."""
     key = (explicit or os.getenv("GROQ_API_KEY") or "").strip()
@@ -512,18 +653,18 @@ def _settings_block(
 # Query-type-specific formatting rules are absent on purpose: rules like
 # "casual replies get 2-4 sentences" or "science replies stay under 300 words"
 # are what made the two kinds of answer read like different assistants.
-_PERSONA_INSTRUCTION = """You are a NASA Microgravity Fire Safety Expert. Synthesize an answer to the user query based ONLY on the provided NASA paper chunks. If the answer is not present, state that additional research is required. At the end of your response, explicitly reference the source papers.
+_PERSONA_INSTRUCTION = """You are a NASA Microgravity Fire Safety Expert. Synthesize an answer to the user query based ONLY on the provided NASA paper chunks. If the answer is not present, state that additional research is required.
 
-FORMATTING RULES (required, apply to every reply):
-- Use clean, structured Markdown only. No HTML.
-- Open with a bold H2-style heading (##) that names the topic.
-- Use bold (**term**) for key terms, quantities, thresholds and material names the first time they appear.
-- Use color-coded callouts where helpful: [!NOTE] for general context, [!TIP] for operational guidance, [!WARNING] for combustion/extinction limits or safety cautions.
-- Present comparisons, multiple materials, or parameter effects as a Markdown table with a header row, or as bullet points (- ).
-- Keep bullets short, one idea per line, and use nested sub-bullets for detail.
-- Cite sources inline exactly like [19930010989.pdf p.202] right after the claim they support.
-- End with a short "Sources" bullet list naming each paper and page used.
-- Do not invent citations; only cite papers/pages actually present in the retrieved chunks.
+OUTPUT CONTRACT - CLEAN STANDARD MARKDOWN ONLY:
+- Write like an official NASA engineering brief: formal, rigorous, data-driven and objective.
+- Never output HTML of any kind. Do not use <span>, <div>, <b>, <i>, <br>, style="...", color codes or any other tag.
+- Never use Markdown callout blocks or alert markers: no "[!NOTE]", "[!WARNING]", "[!TIP]", "[!IMPORTANT]", "[!CAUTION]" and no "> [!...]" blockquotes. Use a bold lead-in such as "**Note:**" instead.
+- Use only these Markdown elements: "##" and "###" headings, **bold** text, dash (-) bullets and numeric citations [1], [2].
+- HEADINGS: Open with a "##" heading naming the topic, then use "###" subheadings. Do not use "#" or "####".
+- BOLD: Use **term** for key terms, quantities, thresholds and material names the first time they appear. Do not over-use bold.
+- CITATIONS: Cite inline ONLY with numeric tags [1], [2], [3]. The numbers are assigned by the retrieved context: [1] is the first retrieved chunk, [2] the second, and so on. Never write a file name, full path, page number or bracketed file name inside the body text. Never invent a citation number that is not present in the retrieved context.
+- BULLETS: Use dash bullets (-) for lists, one idea per line. Use indented dash sub-bullets only when absolutely necessary.
+- SOURCES: End with a short "### Sources" dash list, one line per cited chunk, in the form "- [1] np-2015-...pdf, p. 12". Only cite chunks actually present in the retrieved context; never invent papers, pages or authors.
 """
 
 
@@ -551,12 +692,14 @@ def _system_instruction(
         "simulation, so describe that output as an estimate.",
         "",
         "Retrieved context:",
-        "- PASSAGES may be attached to the user's message. When they answer the "
-        "question, use them as your source and cite inline like "
-        "[19930010989.pdf p.202] - keeping this same voice and formatting as "
-        "everything else.",
-        "- When they do not answer the question, ignore them instead of forcing "
-        "a citation.",
+        "- PASSAGES may be attached to the user's message. Each passage starts "
+        "with a numeric key such as [1] or [2]. When a passage answers the "
+        "question, cite it inline by that exact key and keep the same clean "
+        "Markdown voice as everything else.",
+        "- The numeric keys correspond one-to-one with the source pills shown "
+        "beneath the answer. Never cite a number that is not attached.",
+        "- When the attached passages do not answer the question, ignore them "
+        "instead of forcing a citation.",
         "- When none are attached, state that additional research is required "
         "rather than answering from general knowledge.",
     ]
@@ -579,7 +722,7 @@ def _user_turn(question: str, context_text: str) -> str:
     return (
         f"{question}\n\n"
         "Retrieved passages (use these only if they actually answer the "
-        "question above):\n" + passages
+        "question above; cite them inline by their bracketed number):\n" + passages
     )
 
 
@@ -953,26 +1096,34 @@ def query_agent(request: QueryRequest):
     for doc in docs:
         meta = doc["metadata"]
         source = str(meta.get("source") or "Unknown File")
-        page = meta.get("page", "N/A")
+        filename = _file_name(source) or "Unknown File"
+        page = meta.get("page_label") or meta.get("page") or "N/A"
         snippet = doc["page_content"]
+        number = len(retrieved_sources) + 1
+        confidence = confidence_of(doc.get("distance"))
         retrieved_sources.append(
             {
+                "number": number,
                 "source": source,
-                "filename": _file_name(source),
+                "filename": filename,
                 "page": page,
                 "snippet": snippet,
                 "title": source_title(meta, source),
                 "url": source_url(source),
-                "confidence": confidence_of(doc.get("distance")),
+                "confidence": confidence,
             }
         )
-        context_text += (
-            f"\n[PASSAGE {len(citations) + 1}] {source} (page {page})\n{snippet}\n"
-        )
+        # The model sees the numeric key, never a long filesystem path. That is
+        # the same key the answer cites and the UI renders as a source pill.
+        context_text += f"\n[{number}] {filename} (page {page})\n{snippet}\n"
         citations.append({
+            "number": number,
             "title": source_title(meta, source),
+            "filename": filename,
+            "source": source,
             "url": source_url(source),
-            "confidence": confidence_of(doc.get("distance")),
+            "page": page,
+            "confidence": confidence,
         })
 
     # One code path for every message: hand the question, whatever passages
@@ -996,6 +1147,10 @@ def query_agent(request: QueryRequest):
             request.history,
         )
 
+    # One final gate: no HTML spans, no alert callouts and no raw PDF paths in
+    # any response path, including the retrieval preview shown without an API key.
+    ai_answer = _sanitize_answer(ai_answer, citations)
+
     confidence = (
         round(sum(c["confidence"] for c in citations) / len(citations), 4)
         if citations
@@ -1011,7 +1166,16 @@ def query_agent(request: QueryRequest):
         "ai_answer": ai_answer,
         "retrieved_sources": retrieved_sources,
         "sources": [
-            {"source": src["source"], "snippet": src["snippet"]}
+            {
+                "number": src["number"],
+                "source": src["source"],
+                "filename": src["filename"],
+                "page": src["page"],
+                "snippet": src["snippet"],
+                "title": src["title"],
+                "url": src["url"],
+                "confidence": src["confidence"],
+            }
             for src in retrieved_sources
         ],
         "gravity_filter": request.gravity_filter,
