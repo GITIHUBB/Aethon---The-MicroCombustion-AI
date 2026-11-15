@@ -358,6 +358,7 @@ def rerank_provider() -> str:
 
 
 def source_url(source: Any) -> str:
+<<<<<<< HEAD
     """Build a citable link from an indexed file name.
 
     Prefers any real document URL already stored in the citation metadata
@@ -385,6 +386,12 @@ def source_url(source: Any) -> str:
         return f"https://ntrs.nasa.gov/citations/{stem}"
     # More targeted NTRS search using the document title stem rather than
     # a generic fallback query.
+=======
+    """Build a citable NASA link from an indexed file name."""
+    stem = os.path.splitext(_file_name(source))[0].strip()
+    if re.fullmatch(r"\d{6,}", stem):
+        return f"https://ntrs.nasa.gov/citations/{stem}"
+>>>>>>> 90ba7fb8a8073d47cc8c38d4b946bfdb2bf5e814
     return f"https://ntrs.nasa.gov/search?q={quote(stem) or 'microgravity+combustion'}"
 
 
@@ -528,6 +535,7 @@ def _sanitize_answer(text: str, citations: Optional[list] = None) -> str:
 
         answer = _NUM_CITATION_RE.sub(_valid_citation, answer)
 
+<<<<<<< HEAD
     # --- PURGE LLM GIBBERISH / BROKEN OUTPUT ---
     # Drop common conversational filler at the start of answers.
     answer = re.sub(
@@ -557,6 +565,12 @@ def _sanitize_answer(text: str, citations: Optional[list] = None) -> str:
         return "No usable answer was returned by the model."
 
     return answer
+=======
+    # Tidy whitespace left behind by removed markup.
+    answer = re.sub(r"[ \t]+\n", "\n", answer)
+    answer = re.sub(r"\n{3,}", "\n\n", answer)
+    return answer.strip()
+>>>>>>> 90ba7fb8a8073d47cc8c38d4b946bfdb2bf5e814
 
 
 def _primary_key(explicit: Optional[str] = None) -> Optional[str]:

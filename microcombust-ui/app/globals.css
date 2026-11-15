@@ -809,7 +809,11 @@ body::before {
   }
   .msgs {
     flex: 1;
+<<<<<<< HEAD
     max-height: 500px;
+=======
+    max-height: 70vh;
+>>>>>>> 90ba7fb8a8073d47cc8c38d4b946bfdb2bf5e814
     overflow-y: auto;
     min-height: 0;
     padding: 20px;

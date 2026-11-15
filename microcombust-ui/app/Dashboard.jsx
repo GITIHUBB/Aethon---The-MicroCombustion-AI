@@ -547,7 +547,11 @@ function findSourceByNumber(sources, number) {
 // Defensive display cleanup: the API sanitises answers, but this also keeps
 // older messages and pasted model output from showing literal HTML/callouts.
 function sanitizeForDisplay(text) {
+<<<<<<< HEAD
   let cleaned = String(text || '')
+=======
+  return String(text || '')
+>>>>>>> 90ba7fb8a8073d47cc8c38d4b946bfdb2bf5e814
     .replace(/<\s*br\s*\/?\s*>/gi, '\n')
     .replace(/<\s*(?:b|strong)\b[^>]*>/gi, '**')
     .replace(/<\s*\/\s*(?:b|strong)\s*>/gi, '**')
@@ -562,6 +566,7 @@ function sanitizeForDisplay(text) {
     .replace(/^[ \t]*#[ \t]+/gm, '## ')
     .replace(/\u00a0/g, ' ')
     .replace(/\n{3,}/g, '\n\n');
+<<<<<<< HEAD
 
   // Strip common LLM filler / preamble so the answer starts with substance.
   cleaned = cleaned.replace(/^(here is|here's|the answer is|based on the|according to|in summary|to summarize|certainly|sure|absolutely|of course|i can confirm|it appears|it seems|note that|please note|keep in mind|remember that|let me|i would|i will|here are|the following|below is|above is|additionally|furthermore|moreover|however|therefore|thus|hence|specifically|particularly|especially|notably|importantly|basically|actually|generally|typically|usually|normally|commonly|ordinarily|regularly|frequently|often|sometimes|occasionally|rarely|merely|simply|just|only|exactly|precisely|correctly|properly|rightly|appropriately)\b[ :–—-]*/i, '');
@@ -579,6 +584,8 @@ function sanitizeForDisplay(text) {
   cleaned = cleaned.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 
   return cleaned;
+=======
+>>>>>>> 90ba7fb8a8073d47cc8c38d4b946bfdb2bf5e814
 }
 
 function inlineToNodes(str, sources, onOpen) {
@@ -1708,6 +1715,35 @@ export default function Dashboard() {
               </div>
             </Panel>
 
+<<<<<<< HEAD
+=======
+            {/* Backend simulation results (standalone card, between controls and matrix) */}
+            {remoteRank && topRisk && (
+              <Panel title="Backend simulation results" icon={Flame} a="#34d399" b="#22d3ee" iconColor="#34d399">
+                <div className="pb">
+                  <div className="sim-insight">
+                    <div className="sim-insight-header">
+                      <Flame aria-hidden />
+                      Backend simulation results
+                    </div>
+                    <div className="sim-insight-body">
+                      <span className="sim-insight-conditions">
+                        Calculated at {gravity}, {oxygen}% O₂, {pressure} kPa, {airflow} cm/s airflow, fuel: {fuel}.
+                      </span>
+                    </div>
+                    <div className="sim-insight-result">
+                      <span>
+                        Highest risk: <span className="material">{topRisk.material}</span> —{' '}
+                        <span className="score">{Math.round(topRisk.score * 100)}</span>{' '}
+                        <span className="tier">({topRisk.tier})</span>
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </Panel>
+            )}
+
+>>>>>>> 90ba7fb8a8073d47cc8c38d4b946bfdb2bf5e814
             <Panel
               title="Material flammability risk matrix"
               icon={AlertTriangle}
@@ -1749,6 +1785,7 @@ export default function Dashboard() {
                   <Sparkles aria-hidden />
                   {rankNote}
                 </p>
+<<<<<<< HEAD
                 {remoteRank && topRisk && (
                   <div className="sim-result flush">
                     <div className="sim-insight">
@@ -1771,6 +1808,8 @@ export default function Dashboard() {
                     </div>
                   </div>
                 )}
+=======
+>>>>>>> 90ba7fb8a8073d47cc8c38d4b946bfdb2bf5e814
               </div>
             </Panel>
           </div>
