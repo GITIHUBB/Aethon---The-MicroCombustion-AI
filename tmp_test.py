@@ -1,0 +1,10 @@
+import main
+h = main.read_root()
+print('health keys:', sorted(h.keys()))
+print('doc_count:', h.get('doc_count'))
+print('index_ready:', h.get('index_ready'))
+print('--- parse_questions tests ---')
+print(main._parse_questions('["What is flame spread?","How does oxygen affect combustion?","Which materials self-extinguish?"]'))
+print(main._parse_questions('1. What is flame spread?\n2. How does oxygen affect combustion?\n3. Which materials self-extinguish?'))
+print(main._parse_questions('not json at all'))
+print(main._parse_questions(None))
